@@ -30,6 +30,7 @@
 #include "sysdeps.h"
 #include <unistd.h>
 #include <dlfcn.h>
+#include <drm_fourcc.h>
 
 #ifdef HAVE_VA_X11
 # include "i965_output_dri.h"
@@ -201,6 +202,92 @@ get_bpp_from_fourcc(unsigned int fourcc)
         bpp += info->bpp[i];
 
     return bpp;
+}
+
+static unsigned int
+get_fourcc_from_drm_fourcc(uint32_t drm_fourcc)
+{
+    switch (drm_fourcc) {
+    case DRM_FORMAT_NV12:
+        return VA_FOURCC_NV12;
+    case DRM_FORMAT_YUV420:
+        return VA_FOURCC_I420;
+    case DRM_FORMAT_YVU420:
+        return VA_FOURCC_YV12;
+    case DRM_FORMAT_YUV422:
+        return VA_FOURCC_422H;
+    case DRM_FORMAT_YVU422:
+        return VA_FOURCC_YV16;
+    case DRM_FORMAT_YUYV:
+        return VA_FOURCC_YUY2;
+    case DRM_FORMAT_UYVY:
+        return VA_FOURCC_UYVY;
+    case DRM_FORMAT_YUV444:
+        return VA_FOURCC_444P;
+    case DRM_FORMAT_YUV411:
+        return VA_FOURCC_411P;
+    case DRM_FORMAT_R8:
+        return VA_FOURCC_Y800;
+
+    case DRM_FORMAT_ABGR8888:
+        return VA_FOURCC_RGBA;
+    case DRM_FORMAT_XBGR8888:
+        return VA_FOURCC_RGBX;
+    case DRM_FORMAT_ARGB8888:
+        return VA_FOURCC_BGRA;
+    case DRM_FORMAT_XRGB8888:
+        return VA_FOURCC_BGRX;
+    case DRM_FORMAT_BGRA8888:
+        return VA_FOURCC_ARGB;
+    case DRM_FORMAT_RGBA8888:
+        return VA_FOURCC_ABGR;
+
+    default:
+        return 0;
+    }
+}
+
+static uint32_t
+get_drm_fourcc_from_fourcc(unsigned int fourcc)
+{
+    switch (fourcc) {
+    case VA_FOURCC_NV12:
+        return DRM_FORMAT_NV12;
+    case VA_FOURCC_I420:
+        return DRM_FORMAT_YUV420;
+    case VA_FOURCC_YV12:
+        return DRM_FORMAT_YVU420;
+    case VA_FOURCC_422H:
+        return DRM_FORMAT_YUV422;
+    case VA_FOURCC_YV16:
+        return DRM_FORMAT_YVU422;
+    case VA_FOURCC_YUY2:
+        return DRM_FORMAT_YUYV;
+    case VA_FOURCC_UYVY:
+        return DRM_FORMAT_UYVY;
+    case VA_FOURCC_444P:
+        return DRM_FORMAT_YUV444;
+    case VA_FOURCC_411P:
+        return DRM_FORMAT_YUV411;
+    case VA_FOURCC_Y800:
+        return DRM_FORMAT_R8;
+
+    case VA_FOURCC_RGBA:
+        return DRM_FORMAT_ABGR8888;
+    case VA_FOURCC_RGBX:
+        return DRM_FORMAT_XBGR8888;
+    case VA_FOURCC_BGRA:
+        return DRM_FORMAT_ARGB8888;
+    case VA_FOURCC_BGRX:
+        return DRM_FORMAT_XRGB8888;
+    case VA_FOURCC_ARGB:
+        return DRM_FORMAT_BGRA8888;
+    case VA_FOURCC_ABGR:
+        return DRM_FORMAT_RGBA8888;
+
+    default:
+        return 0;
+    }
 }
 
 enum {
@@ -1777,6 +1864,145 @@ i965_CreateSurfaces(VADriverContextP ctx,
                                 num_surfaces,
                                 NULL,
                                 0);
+}
+
+VAStatus
+i965_CreateSurfaceFromDmabuf(VADriverContextP ctx,
+                             VASurfaceDmabuf *dmabuf,
+                             VASurfaceID *surface)
+{
+    const i965_fourcc_info *fourcc_info;
+    uint8_t num_planes;
+    unsigned long fd;
+    unsigned int format;
+    int i;
+    VASurfaceAttrib attrib;
+    VASurfaceAttribExternalBuffers buf;
+
+    ASSERT_RET(!!dmabuf && !!surface, VA_STATUS_ERROR_INVALID_PARAMETER);
+
+    fourcc_info = get_fourcc_info(get_fourcc_from_drm_fourcc(
+            dmabuf->drm_fourcc));
+
+    ASSERT_RET(fourcc_info, VA_STATUS_ERROR_INVALID_PARAMETER);
+
+    num_planes = fourcc_info->num_planes;
+    for (i = 1; i < num_planes; i++)
+        if (dmabuf->fds[i] != dmabuf->fds[0])
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    attrib.type = VASurfaceAttribExternalBufferDescriptor;
+    attrib.flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrib.value.type = VAGenericValueTypePointer;
+    attrib.value.value.p = &buf;
+
+    buf.pixel_format = fourcc_info->fourcc;
+    buf.width = dmabuf->width;
+    buf.height = dmabuf->height;
+    buf.data_size = dmabuf->offsets[num_planes-1] +
+            dmabuf->pitches[num_planes-1] * dmabuf->height;
+    buf.num_planes = num_planes;
+    for (i = 0; i < num_planes; i++) {
+        buf.pitches[i] = dmabuf->pitches[i];
+        buf.offsets[i] = dmabuf->offsets[i];
+    }
+    fd = dmabuf->fds[0];
+    buf.buffers = &fd;
+    buf.num_buffers = 1;
+    switch (dmabuf->modifier) {
+    case DRM_FORMAT_MOD_NONE:
+        buf.flags = 0;
+        break;
+    case I915_FORMAT_MOD_Y_TILED:
+        buf.flags = VA_SURFACE_EXTBUF_DESC_ENABLE_TILING;
+        break;
+    default:
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    buf.private_data = NULL;
+
+    switch (fourcc_info->subsampling) {
+    case SUBSAMPLE_YUV400:
+        format = VA_RT_FORMAT_YUV400;
+        break;
+    case SUBSAMPLE_YUV420:
+        format = VA_RT_FORMAT_YUV420;
+        break;
+    case SUBSAMPLE_YUV422H:
+    case SUBSAMPLE_YUV422V:
+        format = VA_RT_FORMAT_YUV422;
+        break;
+    case SUBSAMPLE_YUV444:
+        format = VA_RT_FORMAT_YUV444;
+        break;
+    case SUBSAMPLE_YUV411:
+        format = VA_RT_FORMAT_YUV411;
+        break;
+    case SUBSAMPLE_RGBX:
+        format = VA_RT_FORMAT_RGB32;
+        break;
+    default:
+        format = 0;
+        break;
+    }
+
+    return i965_CreateSurfaces2(ctx,
+                                format,
+                                dmabuf->width,
+                                dmabuf->height,
+                                surface,
+                                1,
+                                &attrib,
+                                1);
+}
+
+VAStatus
+i965_ExportSurfaceDmabuf(VADriverContextP ctx,
+                         VASurfaceID surface,
+                         VASurfaceDmabuf *dmabuf)
+{
+    struct i965_driver_data *i965 = i965_driver_data(ctx);
+    struct object_surface *obj_surface = SURFACE(surface);
+    const i965_fourcc_info *fourcc_info;
+    int i, fd;
+
+    ASSERT_RET(obj_surface, VA_STATUS_ERROR_INVALID_SURFACE);
+    ASSERT_RET(dmabuf, VA_STATUS_ERROR_INVALID_PARAMETER);
+
+    fourcc_info = get_fourcc_info(obj_surface->fourcc);
+
+    ASSERT_RET(fourcc_info, VA_STATUS_ERROR_INVALID_SURFACE);
+
+    if (drm_intel_bo_gem_export_to_prime(obj_surface->bo, &fd) != 0)
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+
+    dmabuf->width = obj_surface->orig_width;
+    dmabuf->height = obj_surface->orig_height;
+    dmabuf->drm_fourcc = get_drm_fourcc_from_fourcc(obj_surface->fourcc);
+    dmabuf->fds[0] = fd;
+    dmabuf->pitches[0] = obj_surface->width;
+    dmabuf->offsets[0] = 0;
+    if (fourcc_info->num_planes >= 2) {
+        dmabuf->fds[1] = fd;
+        dmabuf->pitches[1] = obj_surface->cb_cr_pitch;
+        dmabuf->offsets[1] = obj_surface->width * obj_surface->height;
+    }
+    if (fourcc_info->num_planes >= 3) {
+        dmabuf->fds[2] = fd;
+        dmabuf->pitches[2] = obj_surface->cb_cr_pitch;
+        dmabuf->offsets[2] = dmabuf->offsets[0] + dmabuf->pitches[0] * obj_surface->cb_cr_height;
+    }
+    for (i = fourcc_info->num_planes; i < 4; i++) {
+        dmabuf->fds[i] = -1;
+        dmabuf->pitches[i] = dmabuf->offsets[i] = 0;
+    }
+
+    if (obj_surface->user_disable_tiling)
+        dmabuf->modifier = DRM_FORMAT_MOD_NONE;
+    else
+        dmabuf->modifier = I915_FORMAT_MOD_Y_TILED;
+
+    return VA_STATUS_SUCCESS;
 }
 
 VAStatus 
@@ -6931,6 +7157,9 @@ VA_DRIVER_INIT_FUNC(  VADriverContextP ctx )
     /* 0.36.0 */
     vtable->vaAcquireBufferHandle = i965_AcquireBufferHandle;
     vtable->vaReleaseBufferHandle = i965_ReleaseBufferHandle;
+
+    vtable->vaCreateSurfaceFromDmabuf = i965_CreateSurfaceFromDmabuf;
+    vtable->vaExportSurfaceDmabuf = i965_ExportSurfaceDmabuf;
 
     vtable_vpp->vaQueryVideoProcFilters = i965_QueryVideoProcFilters;
     vtable_vpp->vaQueryVideoProcFilterCaps = i965_QueryVideoProcFilterCaps;
